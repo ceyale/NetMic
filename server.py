@@ -6,10 +6,17 @@ Receives raw 16-bit mono PCM over UDP from the NetMic phone client and plays it
 through an audio output device. Point --output-device at a virtual cable
 (e.g. VB-Cable's "CABLE Input") and other apps can use it as a microphone.
 
-Wire protocol (identical in phone_client/client.py):
+Wire protocol (identical in phone_client/client.py and gui_client/network_stream.py):
     header (9 bytes, big endian): magic "NM" | type u8 | session u16 | seq u32
-    type 1 = AUDIO (payload: raw int16 PCM), 2 = ACK (payload: u32 sample rate),
-    type 3 = BYE
+    type 1 = AUDIO (payload: raw int16 PCM)
+    type 2 = ACK   (payload: u32 sample rate [, u32 received, u32 lost] - extra
+                    fields are optional; older clients that only read the rate
+                    just ignore the rest of the datagram)
+    type 3 = BYE   (payload: none)
+    type 4 = PING  (payload: 8 bytes, sender's timestamp - opaque, echoed back)
+    type 5 = PONG  (payload: the PING payload, echoed verbatim, for RTT timing)
+PING/PONG work even before any AUDIO packet has been sent, so a client can
+measure link health without starting the microphone.
 """
 
 import argparse
@@ -40,7 +47,7 @@ DEFAULT_MAX_BUFFER_MS = 250    # hard cap on buffered audio (bounds latency)
 # --------------------------------------------------------------------------
 MAGIC = b"NM"
 HEADER = struct.Struct(">2sBHI")
-T_AUDIO, T_ACK, T_BYE = 1, 2, 3
+T_AUDIO, T_ACK, T_BYE, T_PING, T_PONG = 1, 2, 3, 4, 5
 BYTES_PER_FRAME = 2            # 16-bit mono
 
 # --------------------------------------------------------------------------
@@ -265,6 +272,14 @@ class NetMicServer:
             if self.client_addr and addr[0] == self.client_addr[0] and session == self.session:
                 log.info("Client %s disconnected (goodbye received).", addr[0])
                 self._reset_client()
+        elif ptype == T_PING:
+            # Answered for anyone, even before a session is established, so a
+            # control-panel client can probe link health before it starts streaming.
+            reply = HEADER.pack(MAGIC, T_PONG, session, seq) + data[HEADER.size:]
+            try:
+                self.sock.sendto(reply, addr)
+            except OSError as exc:
+                self._log_every("pong", 10, logging.WARNING, "Could not send PONG: %s", exc)
 
     def _start_client(self, addr, session, seq):
         self._reset_client()
@@ -306,7 +321,10 @@ class NetMicServer:
 
     def _send_ack(self, now):
         self.last_ack = now
-        pkt = HEADER.pack(MAGIC, T_ACK, self.session, 0) + struct.pack(">I", self.rate)
+        # Extra fields beyond the sample rate are additive: legacy clients that
+        # only unpack the first u32 keep working unmodified.
+        pkt = (HEADER.pack(MAGIC, T_ACK, self.session, 0)
+               + struct.pack(">III", self.rate, self.received, self.lost))
         try:
             self.sock.sendto(pkt, self.client_addr)
         except OSError as exc:
